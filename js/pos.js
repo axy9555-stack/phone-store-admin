@@ -25,7 +25,7 @@
 
   function newCart(staffId) {
     var staff = byId('staff', staffId) || (Store.get('staff') || [])[0] || null;
-    return { staffId: staff ? staff.id : '', items: [], discount: null, tradeIn: null };
+    return { staffId: staff ? staff.id : '', items: [], discount: null, tradeIn: null, subsidy: null };
   }
 
   function findLine(cart, productId, imei) {
@@ -92,6 +92,7 @@
     cart.items.slice().forEach(function (it, i) { removeItem(cart, i); });
     cart.discount = null;
     cart.tradeIn = null;
+    cart.subsidy = null;
     return { ok: true };
   }
 
@@ -119,10 +120,12 @@
     var afterDisc = round2(subtotal - discount);
     var tradeIn = cart.tradeIn ? Math.min(Number(cart.tradeIn.deduct) || 0, afterDisc) : 0;
     tradeIn = round2(tradeIn);
+    var subsidy = cart.subsidy ? Math.min(Number(cart.subsidy.amount) || 0, afterDisc - tradeIn) : 0;
+    subsidy = round2(Math.max(subsidy, 0));
     return {
       subtotal: subtotal, cost: cost,
-      discount: discount, tradeIn: tradeIn,
-      total: round2(Math.max(afterDisc - tradeIn, 0))
+      discount: discount, tradeIn: tradeIn, subsidy: subsidy,
+      total: round2(Math.max(afterDisc - tradeIn - subsidy, 0))
     };
   }
 
@@ -204,6 +207,14 @@
       }
     }
 
+    // 国补预检：结账时再校验一次资格（垫付前把关）
+    if (cart.subsidy) {
+      var subPre = root.PSSubsidy && root.PSSubsidy.checkEligibility
+        ? root.PSSubsidy.checkEligibility({ productId: cart.subsidy.productId, idNumber: cart.subsidy.idNumber, customerName: cart.subsidy.customerName })
+        : { ok: true };
+      if (!subPre.ok) return fail('国补校验未通过：' + subPre.reason);
+    }
+
     var paid = pay.paidAmount === undefined || pay.paidAmount === null || pay.paidAmount === ''
       ? t.total : Number(pay.paidAmount);
     if (!isFinite(paid) || paid < t.total) return fail('实收金额不能低于应付金额');
@@ -240,6 +251,7 @@
     var order = {
       id: nextOrderId(day), items: items,
       subtotal: t.subtotal, discount: t.discount, tradeIn: t.tradeIn,
+      subsidyAmount: t.subsidy,
       total: t.total, cost: t.cost,
       payMethod: pay.payMethod, paidAmount: round2(paid), change: change,
       customerId: customer ? customer.id : '', staffId: cart.staffId,
@@ -257,9 +269,37 @@
       customer.balance = round2(Number(customer.balance) - t.total);
     }
     Store.get('orders').push(order);
+    if (cart.subsidy && t.subsidy > 0) {
+      // 国补由商家垫付：写入国补记录，事后向政府申报结算
+      var subRec = {
+        id: nextSubsidyId(day),
+        orderId: order.id,
+        customerName: cart.subsidy.customerName,
+        idNumber: cart.subsidy.idNumber,
+        productId: cart.subsidy.productId,
+        imei: cart.subsidy.imei,
+        amount: t.subsidy,
+        status: '待申报',
+        createdAt: day, submittedAt: null, settledAt: null, rejectReason: ''
+      };
+      Store.get('subsidies').push(subRec);
+      order.subsidyId = subRec.id;
+    }
     Store.save();
-    cart.items = []; cart.discount = null; cart.tradeIn = null; // 已结清
+    cart.items = []; cart.discount = null; cart.tradeIn = null; cart.subsidy = null; // 已结清
     return { ok: true, order: order, change: change };
+  }
+
+  function nextSubsidyId(day) {
+    var prefix = 'GB' + day.replace(/-/g, '');
+    var max = 0;
+    (Store.get('subsidies') || []).forEach(function (r) {
+      if (String(r.id).indexOf(prefix) === 0) {
+        var n = parseInt(String(r.id).slice(prefix.length), 10);
+        if (n > max) max = n;
+      }
+    });
+    return prefix + pad(max + 1, 3);
   }
 
   /* ---------- 渲染 ---------- */
@@ -280,6 +320,24 @@
     return (Store.get('imeis') || []).filter(function (r) {
       return r.productId === productId && r.status === '在库';
     });
+  }
+
+  // 购物车里的手机行（国补只针对手机）
+  function phoneLines(cart) {
+    return (cart.items || []).filter(function (it) {
+      var p = byId('products', it.productId);
+      return p && p.category === PHONE;
+    });
+  }
+
+  function readSubPick(form, cart) {
+    var sel = form.elements.phoneIdx;
+    if (sel && sel.value) {
+      var v = sel.value.split('|');
+      return { productId: v[0], imei: v[1] };
+    }
+    var it = phoneLines(cart)[0];
+    return it ? { productId: it.productId, imei: it.imei } : {};
   }
 
   function productHtml(p, i) {
@@ -351,6 +409,8 @@
       (cart.discount ? ' <button type="button" class="link-btn small" data-action="clear-discount">移除</button>' : '') + '</dd>' +
       '<dt>以旧换新抵扣</dt><dd>' + (t.tradeIn ? '−' + money(t.tradeIn) : '—') +
       (cart.tradeIn ? ' <button type="button" class="link-btn small" data-action="clear-tradein">移除</button>' : '') + '</dd>' +
+      '<dt>国补立减</dt><dd>' + (t.subsidy ? '−' + money(t.subsidy) : '—') +
+      (cart.subsidy ? ' <button type="button" class="link-btn small" data-action="clear-subsidy">移除</button>' : '') + '</dd>' +
       '<dt class="pos-pay-label">应付</dt><dd class="pos-pay">' + money(t.total) + '</dd></dl>';
 
     html += '<div class="pos-tools"><form class="inline-form" data-form="discount">' +
@@ -359,7 +419,31 @@
       '<option value="percent"' + (cart.discount && cart.discount.type === 'percent' ? ' selected' : '') + '>整单打折（%）</option></select></div>' +
       '<div class="field"><label for="pos-disc-value">数值</label><input id="pos-disc-value" name="value" type="number" inputmode="decimal" min="0" step="0.01"></div>' +
       '<button type="submit" class="btn btn-secondary">应用优惠</button></form>' +
-      '<button type="button" class="btn btn-secondary" data-action="tradein-form">以旧换新</button></div>';
+      '<button type="button" class="btn btn-secondary" data-action="tradein-form">以旧换新</button>' +
+      '<button type="button" class="btn btn-secondary" data-action="subsidy-form"' +
+      (phoneLines(cart).length ? '' : ' disabled') + '>申请国补</button></div>';
+
+    if (ui.subsidyForm) {
+      var sr = root.PSSubsidy ? root.PSSubsidy.rules() : { rate: 0.15, cap: 500, maxPrice: 6000, perPersonLimit: 1 };
+      var pickOpts = phoneLines(cart).map(function (it) {
+        var p = byId('products', it.productId);
+        var v = esc(p.id) + '|' + esc(it.imei || '');
+        return '<option value="' + v + '">' + esc(p.name) + (it.imei ? '（串号 ' + esc(it.imei) + '）' : '') + '</option>';
+      }).join('');
+      html += '<form class="detail" data-form="subsidy"><h3>国家以旧换新补贴（商家垫付）</h3>' +
+        '<p class="muted small">单件售价 ≤ ' + sr.maxPrice + ' 元可补，补贴 = 售价 × ' + Math.round(sr.rate * 100) +
+        '%（单件最高 ' + sr.cap + ' 元），每人每类限 ' + (sr.perPersonLimit || 1) + ' 件。</p>' +
+        (phoneLines(cart).length > 1
+          ? '<div class="field"><label for="pos-sub-phone">享受国补的手机</label><select id="pos-sub-phone" name="phoneIdx">' + pickOpts + '</select></div>'
+          : '') +
+        '<div class="form-grid">' +
+        '<div class="field"><label for="pos-sub-name">客户姓名</label><input id="pos-sub-name" name="customerName" type="text" autocomplete="off"></div>' +
+        '<div class="field"><label for="pos-sub-id">身份证号（18 位，末位可为 X）</label><input id="pos-sub-id" name="idNumber" type="text" inputmode="numeric" maxlength="18" autocomplete="off"></div>' +
+        '</div><p data-slot="sub-quote" class="muted"></p>' +
+        '<div class="actions"><button type="button" class="btn btn-secondary" data-action="subsidy-check">先校验</button>' +
+        '<button type="submit" class="btn btn-primary">应用国补</button>' +
+        '<button type="button" class="btn btn-secondary" data-action="subsidy-cancel">取消</button></div></form>';
+    }
 
     if (ui.tradeForm) {
       html += '<form class="detail" data-form="tradein"><h3>以旧换新估价</h3><div class="form-grid">' +
@@ -427,6 +511,7 @@
       (o.subtotal !== o.total ? '<dt>小计</dt><dd>' + money(o.subtotal) + '</dd>' : '') +
       (o.discount ? '<dt>整单优惠</dt><dd>−' + money(o.discount) + '</dd>' : '') +
       (o.tradeIn ? '<dt>以旧换新抵扣</dt><dd>−' + money(o.tradeIn) + '</dd>' : '') +
+      (o.subsidyAmount ? '<dt>国补立减</dt><dd>−' + money(o.subsidyAmount) + '</dd>' : '') +
       '<dt>应付</dt><dd>' + money(o.total) + '</dd>' +
       '<dt>实收（' + esc(o.payMethod) + '）</dt><dd>' + money(o.paidAmount) + '</dd>' +
       (o.change ? '<dt>找零</dt><dd>' + money(o.change) + '</dd>' : '') +
@@ -443,7 +528,8 @@
     var staff0 = (Store.get('staff') || [])[0];
     var ui = {
       cart: newCart(staff0 ? staff0.id : ''), keyword: '', picking: null,
-      payMethod: '现金', paid: '', customerId: '', tradeForm: false, tiQuote: null, done: null
+      payMethod: '现金', paid: '', customerId: '', tradeForm: false, tiQuote: null,
+      subsidyForm: false, subsidyQuote: null, done: null
     };
     var wrap = document.createElement('div');
     wrap.className = 'page';
@@ -519,7 +605,23 @@
         drawRight();
       } else if (action === 'clear-discount') { ui.cart.discount = null; drawRight(); }
       else if (action === 'clear-tradein') { ui.cart.tradeIn = null; drawRight(); }
-      else if (action === 'tradein-form') { ui.tradeForm = !ui.tradeForm; drawRight(); }
+      else if (action === 'clear-subsidy') { ui.cart.subsidy = null; ui.subsidyQuote = null; drawRight(); }
+      else if (action === 'subsidy-form') {
+        ui.subsidyForm = !ui.subsidyForm; ui.subsidyQuote = null; drawRight();
+        if (ui.subsidyForm) wrap.querySelector('#pos-sub-name').focus();
+      } else if (action === 'subsidy-cancel') { ui.subsidyForm = false; ui.subsidyQuote = null; drawRight(); }
+      else if (action === 'subsidy-check') {
+        if (!root.PSSubsidy) return toast('国补模块未加载', 'error');
+        var sf = btn.closest('form');
+        var pick = readSubPick(sf, ui.cart);
+        var chk = root.PSSubsidy.checkEligibility({
+          productId: pick.productId, imei: pick.imei,
+          customerName: sf.elements.customerName.value, idNumber: sf.elements.idNumber.value
+        });
+        ui.subsidyQuote = chk;
+        var subSpan = slot.querySelector('[data-slot="sub-quote"]');
+        if (subSpan) subSpan.textContent = chk.ok ? '校验通过：可享国补 −' + money(chk.amount) : chk.reason;
+      } else if (action === 'tradein-form') { ui.tradeForm = !ui.tradeForm; drawRight(); }
       else if (action === 'tradein-cancel') { ui.tradeForm = false; ui.tiQuote = null; drawRight(); }
       else if (action === 'tradein-quote') {
         var q = root.PSOrders.tradeInQuote(readTradeForm(btn.closest('form')));
@@ -536,6 +638,7 @@
         window.print();
       } else if (action === 'again') {
         ui.tradeForm = false; ui.tiQuote = null; ui.paid = ''; ui.customerId = '';
+        ui.subsidyForm = false; ui.subsidyQuote = null;
         drawPos();
         slot.querySelector('#pos-search').focus();
       }
@@ -560,6 +663,18 @@
         if (!res.ok) return toast(res.reason, 'error');
         ui.tradeForm = false; ui.tiQuote = null;
         drawRight();
+      } else if (kind === 'subsidy') {
+        if (!root.PSSubsidy) return toast('国补模块未加载', 'error');
+        var subPick = readSubPick(form, ui.cart);
+        res = root.PSSubsidy.applyToCart(ui.cart, {
+          productId: subPick.productId, imei: subPick.imei,
+          customerName: form.elements.customerName.value,
+          idNumber: form.elements.idNumber.value
+        });
+        if (!res.ok) return toast(res.reason, 'error');
+        ui.subsidyForm = false; ui.subsidyQuote = null;
+        drawRight();
+        toast('已应用国补 −' + money(res.subsidy.amount), 'success');
       } else if (kind === 'checkout') {
         res = checkout(ui.cart, {
           payMethod: ui.payMethod,

@@ -10,7 +10,7 @@
     return {
       products: [], imeis: [], suppliers: [], purchases: [], orders: [],
       staff: [], commissions: [], customers: [], repairs: [], priceLogs: [],
-      refunds: [], attendances: [], settlements: [], customerLogs: [],
+      refunds: [], attendances: [], settlements: [], customerLogs: [], subsidies: [],
       settings: {}
     };
   }
@@ -107,7 +107,18 @@
       total: 10500, status: '待收货', createdAt: day, receivedAt: null
     }];
 
-    s.settings = { storeName: '手机店', lowStockThreshold: 5 };
+    s.settings = { storeName: '手机店', lowStockThreshold: 5,
+      subsidy: { rate: 0.15, cap: 500, maxPrice: 6000, perPersonLimit: 1 } };
+
+    // 两条演示国补记录（身份证为演示号，符合 18 位格式）
+    s.subsidies = [
+      { id: 'GB' + day.replace(/-/g, '') + '001', orderId: '', customerName: '吴女士',
+        idNumber: '110101199001010011', productId: 'P004', imei: '', amount: 450,
+        status: '待申报', createdAt: day, submittedAt: null, settledAt: null, rejectReason: '' },
+      { id: 'GB' + day.replace(/-/g, '') + '002', orderId: '', customerName: '郑先生',
+        idNumber: '110101199202020022', productId: 'P006', imei: '', amount: 500,
+        status: '已到账', createdAt: day, submittedAt: day, settledAt: day, rejectReason: '' }
+    ];
 
     // 一张待检修维修单，方便演示维修流程
     s.repairs = [{

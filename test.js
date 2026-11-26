@@ -5,7 +5,8 @@ const path = require('path');
 const vm = require('vm');
 
 const FILES = ['js/store.js', 'js/inventory.js', 'js/purchase.js', 'js/pos.js', 'js/orders.js',
-  'js/staff.js', 'js/commission.js', 'js/customers.js', 'js/repair.js', 'js/dashboard.js', 'js/backup.js'];
+  'js/staff.js', 'js/commission.js', 'js/customers.js', 'js/subsidy.js',
+  'js/repair.js', 'js/dashboard.js', 'js/backup.js'];
 
 // 带 document 桩的环境：渲染函数能真实执行（事件不触发）
 function bootDoc() {
@@ -481,6 +482,91 @@ const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 ok(['dashboard', 'inventory', 'purchase', 'cashier', 'orders', 'staff', 'commission', 'customers', 'repairs', 'settings']
   .every(k => html.indexOf(k + ': ') !== -1), 'index.html 路由表 10 项齐全');
 ok(/dashboard: PSDashboard\.render/.test(html), '看板用 PSDashboard.render 渲染（默认首页）');
+
+console.log('国补');
+S.reset();
+const SUB = w.PSSubsidy;
+const SR = SUB.rules();
+ok(SR.rate === 0.15 && SR.cap === 500 && SR.maxPrice === 6000 && SR.perPersonLimit === 1, '默认国补规则：15% / 单件 500 封顶 / 售价 ≤6000 / 每人限 1 件');
+ok(SUB.rules({ rate: 0.6 }).ok === false, '补贴比例超 50% 被拒');
+ok(SUB.rules({ rate: 0 }).ok === false, '补贴比例 0 被拒');
+ok(SUB.rules({ cap: 3000 }).ok === false, '单件上限超 2000 被拒');
+ok(SUB.rules({ maxPrice: 30000 }).ok === false, '限价超 20000 被拒');
+ok(SUB.rules({ rate: 0.2 }).ok && SUB.rules().rate === 0.2, '合法比例可保存');
+ok(SUB.rules({ rate: 0.15 }).ok, '改回默认 15%');
+
+eq(SUB.list().length, 2, 'seed 后 2 条演示国补记录');
+ok(SUB.list().some(r => r.status === '待申报') && SUB.list().some(r => r.status === '已到账'), '一条待申报、一条已到账');
+ok(S.get('subsidies').every(r => /^\d{17}[\dX]$/.test(r.idNumber)), '演示身份证号都符合 18 位格式');
+eq(SUB.pendingAmount(), 450, '待结算总额 = 待申报的 450');
+
+ok(SUB.checkEligibility({ productId: 'P009', idNumber: '110101198001010033' }).ok === false, '非手机类商品不可补');
+ok(SUB.checkEligibility({ productId: 'P001', idNumber: '123' }).ok === false, '身份证号格式不对失败');
+const overPrice = SUB.checkEligibility({ productId: 'P002', idNumber: '110101198001010033' });
+ok(overPrice.ok === false && overPrice.reason.indexOf('6000') !== -1, '售价超 6000 不可补并给原因');
+const capped = SUB.checkEligibility({ productId: 'P001', idNumber: '110101198001010033' });
+ok(capped.ok && capped.amount === 500, '补贴 = 5999 × 15% = 899.85 → 单件封顶 500');
+SUB.rules({ rate: 0.05 });
+const uncapped = SUB.checkEligibility({ productId: 'P007', idNumber: '110101198001010033' });
+ok(uncapped.ok && Math.abs(uncapped.amount - 4299 * 0.05) < 0.01, '未到上限按比例算：4299 × 5% = 214.95');
+SUB.rules({ rate: 0.15 });
+ok(SUB.checkEligibility({ productId: 'P007', idNumber: '110101198001010033' }).amount === 500, '回 15% 后重新封顶');
+
+const g1 = POS.newCart('E001');
+ok(SUB.applyToCart(g1, { productId: 'P001', imei: '', customerName: '赵钱', idNumber: '110101198001010033' }).ok === false, '购物车里没有这台手机时应用失败');
+const subImei = S.get('imeis').find(r => r.productId === 'P001' && r.status === '在库').imei;
+POS.addItem(g1, 'P001', 1, subImei);
+const ap1 = SUB.applyToCart(g1, { productId: 'P001', imei: subImei, customerName: '赵钱', idNumber: '110101198001010033' });
+ok(ap1.ok && g1.subsidy.amount === 500 && g1.subsidy.imei === subImei, '国补挂上购物车');
+ok(POS.cartTotal(g1).subsidy === 500 && POS.cartTotal(g1).total === 5499, '应付扣减国补：5999 − 500 = 5499');
+ok(SUB.applyToCart(g1, { productId: 'P001', imei: subImei, customerName: '赵钱', idNumber: '110101198001010033' }).ok === false, '购物车已有国补再应用被拒');
+SUB.removeFromCart(g1);
+ok(POS.cartTotal(g1).total === 5999, '移除国补后应付恢复');
+ok(SUB.applyToCart(g1, { productId: 'P001', imei: subImei, customerName: '赵钱', idNumber: '110101198001010033' }).ok, '重新应用国补');
+POS.applyTradeIn(g1, 5600);
+ok(POS.cartTotal(g1).total === 0 && POS.cartTotal(g1).subsidy === 399, '与以旧换新叠加但应付不为负：5999 − 5600 − 500 → 封到 0，实垫 399');
+g1.tradeIn = null;
+
+const out1 = POS.checkout(g1, { payMethod: '现金', paidAmount: 5500 });
+ok(out1.ok && out1.change === 1 && out1.order.subsidyAmount === 500, '结账成功：国补从应付中扣除并找零');
+const subRec1 = S.get('subsidies').find(r => r.idNumber === '110101198001010033');
+ok(!!subRec1 && subRec1.status === '待申报' && subRec1.amount === 500 && subRec1.orderId === out1.order.id, '结账生成国补记录（待申报，挂订单号）');
+ok(/^GB\d{11}$/.test(subRec1.id) && subRec1.imei === subImei, '国补单号 GB+日期+序号，记录串号');
+ok(SUB.checkEligibility({ productId: 'P007', idNumber: '110101198001010033' }).ok === false, '同一身份证已有国补记录，重复申补失败');
+ok(g1.subsidy === null, '结账后购物车国补清空');
+
+const g2 = POS.newCart('E002');
+POS.addItem(g2, 'P004', 1, S.get('imeis').find(r => r.productId === 'P004' && r.status === '在库').imei);
+SUB.applyToCart(g2, { productId: 'P004', imei: g2.items[0].imei, customerName: '孙李', idNumber: '110101198202020044' });
+ok(POS.checkout(g2, { payMethod: '微信' }).ok, '第二台国补手机结账');
+ok(SUB.pendingAmount() === 1450, '待结算 = 演示 450 + 两笔新记录 500 + 500 = 1450');
+
+ok(SUB.reject(subRec1.id).ok === false, '驳回须填原因');
+const rej = SUB.reject(subRec1.id, '材料不齐');
+ok(rej.ok && rej.record.status === '已驳回' && rej.record.rejectReason === '材料不齐', '驳回成功并写原因');
+ok(SUB.checkEligibility({ productId: 'P001', idNumber: '110101198001010033' }).ok, '驳回后该身份证可重新申请国补');
+
+const demo1 = SUB.list().find(r => r.status === '待申报' && r.customerName === '吴女士'); // list 新记录在前，按客户名锁定演示单
+ok(SUB.submit(demo1.id).ok && SUB.list().find(r => r.id === demo1.id).status === '已申报', '待申报 → 已申报');
+ok(SUB.submit(demo1.id).ok === false, '不能重复申报');
+const set1 = SUB.settle(demo1.id);
+ok(set1.ok && set1.record.status === '已到账' && set1.record.settledAt === today(), '已申报 → 已到账（记录到账日期）');
+ok(SUB.settle(subRec1.id).ok === false, '待申报不能直接到账');
+ok(SUB.pendingAmount() === 500, '待结算总额重算：只剩新记录的 500（已到账 / 已驳回不计）');
+ok(SUB.list({ status: '待申报' }).length === 1, '按状态筛国补记录');
+ok(SUB.list({ keyword: '110101198001010033' }).length === 1, '按身份证号搜记录');
+ok(SUB.list({ keyword: '吴女士' }).length === 1, '按客户名搜记录');
+ok(SUB.list({ date: today() }).length === 4, '按日期筛记录');
+
+// 渲染与接入检查
+let subThrew = null;
+try { wd.PSSubsidy.renderSubsidy(wd.document.createElement('div')); } catch (e) { subThrew = e; }
+ok(!subThrew, '国补页渲染不抛错' + (subThrew ? '（' + subThrew.message + '）' : ''));
+const posSrc = fs.readFileSync(path.join(__dirname, 'js/pos.js'), 'utf8');
+ok(posSrc.indexOf('申请国补') !== -1 && posSrc.indexOf('clear-subsidy') !== -1, '收银页含国补入口与移除按钮');
+ok(posSrc.indexOf('国补立减') !== -1, '小票含国补立减一行');
+const htmlSrc = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+ok(htmlSrc.indexOf('subsidy: PSSubsidy.renderSubsidy') !== -1 && htmlSrc.indexOf('href="#subsidy"') !== -1 && htmlSrc.indexOf('js/subsidy.js') !== -1, 'index.html 已接入国补导航 / 路由 / 脚本');
 
 console.log('持久化与降级');
 ok(typeof Inv.renderInventory === 'function' && typeof Pur.renderPurchase === 'function', '渲染函数存在');
