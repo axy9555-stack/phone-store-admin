@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>手机店销售管理</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <span class="app-title">手机店销售管理</span>
+    <span class="app-date" id="today"></span>
+  </header>
+
+  <nav class="app-nav" id="nav" aria-label="功能导航">
+    <a href="#dashboard">看板</a>
+    <a href="#cashier">收银</a>
+    <a href="#inventory">库存</a>
+    <a href="#purchase">采购</a>
+    <a href="#orders">订单</a>
+    <a href="#staff">店员</a>
+    <a href="#commission">提成</a>
+    <a href="#customers">会员</a>
+    <a href="#repairs">维修</a>
+    <a href="#settings">设置</a>
+  </nav>
+
+  <main id="app" class="app-main"></main>
+
+  <div id="toast" class="toast-area" role="status" aria-live="polite"></div>
+
+  <script src="js/store.js"></script>
+  <script src="js/inventory.js"></script>
+  <script src="js/purchase.js"></script>
+  <script src="js/pos.js"></script>
+  <script src="js/orders.js"></script>
+  <script src="js/staff.js"></script>
+  <script src="js/commission.js"></script>
+  <script src="js/customers.js"></script>
+  <script src="js/repair.js"></script>
+  <script src="js/dashboard.js"></script>
+  <script src="js/backup.js"></script>
+  <script>
+    (function () {
+      'use strict';
+      var app = document.getElementById('app');
+      var nav = document.getElementById('nav');
+      var toastArea = document.getElementById('toast');
+
+      window.PSToast = function (msg, type) {
+        var item = document.createElement('div');
+        item.className = 'toast toast-' + (type || 'info');
+        item.textContent = msg;
+        toastArea.appendChild(item);
+        setTimeout(function () { item.remove(); }, 3000);
+      };
+
+      // 全部 10 个模块都已接入；dashboard 即默认首页
+      var routes = window.PSRoutes = {
+        dashboard: PSDashboard.render,
+        inventory: PSInventory.renderInventory,
+        purchase: PSPurchase.renderPurchase,
+        cashier: PSPOS.renderPOS,
+        orders: PSOrders.renderOrders,
+        staff: PSStaff.renderStaff,
+        commission: PSCommission.renderCommission,
+        customers: PSCustomers.renderCustomers,
+        repairs: PSRepair.renderRepair,
+        settings: PSBackup.renderBackup
+      };
+
+      function route() {
+        var key = location.hash.replace(/^#\/?/, '') || 'dashboard';
+        var link = nav.querySelector('a[href="#' + key + '"]');
+        if (!link) { key = 'dashboard'; link = nav.querySelector('a[href="#dashboard"]'); }
+        Array.prototype.forEach.call(nav.querySelectorAll('a'), function (a) {
+          if (a === link) a.setAttribute('aria-current', 'page');
+          else a.removeAttribute('aria-current');
+        });
+        var fn = routes[key];
+        if (!fn) { key = 'dashboard'; fn = routes.dashboard; }
+        fn(app);
+        if (link.scrollIntoView) link.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+
+      var now = new Date();
+      document.getElementById('today').textContent =
+        now.getFullYear() + '年' + (now.getMonth() + 1) + '月' + now.getDate() + '日 星期' +
+        '日一二三四五六'.charAt(now.getDay());
+
+      PhoneStore.load();
+      window.addEventListener('hashchange', route);
+      route();
+    })();
+  </script>
+</body>
+</html>
