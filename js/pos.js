@@ -573,6 +573,9 @@
         toast('结账成功，订单 ' + res.order.id, 'success');
       }
     });
+
+    // 首次打开必须先画一次，否则页面一直空白（之前漏了这行）。
+    draw();
   }
 
   root.PSPOS = {
